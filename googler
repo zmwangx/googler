@@ -19,7 +19,6 @@
 
 from __future__ import print_function
 import argparse
-import atexit
 import collections
 import functools
 import gzip
@@ -33,7 +32,9 @@ import re
 import signal
 import sys
 import textwrap
+import urllib.error
 import urllib.parse
+import urllib.request
 
 # Python optional dependency compatibility layer
 try:
@@ -140,8 +141,6 @@ class GoogleUrl(object):
 
     Methods
     -------
-    full()
-    relative()
     update(opts=None, **kwargs)
     set_queries(**kwargs)
     unset_queries(*args)
@@ -176,7 +175,16 @@ class GoogleUrl(object):
     @property
     def url(self):
         """The full Google URL you want."""
-        return self.full()
+        url = (self.scheme + ':') if self.scheme else ''
+        url += '//' + self.netloc
+        url += self.path
+        if self.params:
+            url += ';' + self.params
+        if self.query:
+            url += '?' + self.query
+        if self.fragment:
+            url += '#' + self.fragment
+        return url
 
     @property
     def hostname(self):
@@ -200,40 +208,6 @@ class GoogleUrl(object):
     def news(self):
         """Whether the URL is for Google News."""
         return 'tbm' in self._query_dict and self._query_dict['tbm'] == 'nws'
-
-    def full(self):
-        """Return the full URL.
-
-        Returns
-        -------
-        str
-
-        """
-        url = (self.scheme + ':') if self.scheme else ''
-        url += '//' + self.netloc + self.relative()
-        return url
-
-    def relative(self):
-        """Return the relative URL (without scheme and authority).
-
-        Authority (see RFC 3986 section 3.2), or netloc in the
-        terminology of urllib.parse, basically means the hostname
-        here. The relative URL is good for making HTTP(S) requests to a
-        known host.
-
-        Returns
-        -------
-        str
-
-        """
-        rel = self.path
-        if self.params:
-            rel += ';' + self.params
-        if self.query:
-            rel += '?' + self.query
-        if self.fragment:
-            rel += '#' + self.fragment
-        return rel
 
     def update(self, opts=None, **kwargs):
         """Update the URL with the given options.
@@ -461,197 +435,6 @@ class GoogleUrl(object):
         qd['q'] = q
 
         return '&'.join(['%s=%s' % (k, qd[k]) for k in sorted(qd.keys())])
-
-
-class GoogleConnectionError(Exception):
-    pass
-
-
-class GoogleConnection(object):
-    """
-    This class facilitates connecting to and fetching from Google.
-
-    Parameters
-    ----------
-    See http.client.HTTPSConnection for documentation of the
-    parameters.
-
-    Raises
-    ------
-    GoogleConnectionError
-
-    Attributes
-    ----------
-    host : str
-        The currently connected host. Read-only property. Use
-        `new_connection` to change host.
-
-    Methods
-    -------
-    new_connection(host=None, port=None, timeout=45)
-    renew_connection(timeout=45)
-    fetch_page(url)
-    close()
-
-    """
-
-    def __init__(self, host, port=None, timeout=45):
-        self._host = None
-        self._port = None
-        self._conn = None
-        self.new_connection(host, port=port, timeout=timeout)
-
-    @property
-    def host(self):
-        """The host currently connected to."""
-        return self._host
-
-    def new_connection(self, host=None, port=None, timeout=45):
-        """Close the current connection (if any) and establish a new one.
-
-        Parameters
-        ----------
-        See http.client.HTTPSConnection for documentation of the
-        parameters. Renew the connection (i.e., reuse the current host
-        and port) if host is None or empty.
-
-        Raises
-        ------
-        GoogleConnectionError
-
-        """
-        if self._conn:
-            self._conn.close()
-        if not host:
-            host = self._host
-            port = self._port
-        self._host = host
-        self._port = port
-        logger.debug('Connecting to new host [%s]', host)
-        try:
-            self._conn = http.client.HTTPSConnection(host, port=port, timeout=timeout)
-        except http.client.HTTPException as e:
-            raise GoogleConnectionError('Failed to connect to %s: %s.' % (host, e))
-
-    def renew_connection(self, timeout=45):
-        """Renew current connection.
-
-        Equivalent to ``new_connection(timeout=timeout)``.
-
-        """
-        self.new_connection(timeout=timeout)
-
-    def fetch_page(self, url):
-        """Fetch a URL.
-
-        Allows one reconnection and one redirection before failing and
-        raising GoogleConnectionError.
-
-        Parameters
-        ----------
-        url : str
-            The URL to fetch, relative to the host.
-
-        Raises
-        ------
-        GoogleConnectionError
-            When not getting HTTP 200 even after the allowed one
-            reconnection and/or one redirection, or when Google is
-            blocking query due to unsual activity.
-
-        Returns
-        -------
-        str
-            Response payload, gunzipped (if applicable) and decoded (in UTF-8).
-
-        """
-        try:
-            self._raw_get(url)
-        except http.client.HTTPException as e:
-            logger.debug('Got exception: %s.', e)
-            logger.debug('Attempting to reconnect...')
-            self.renew_connection()
-            try:
-                self._raw_get(url)
-            except http.client.HTTPException as e:
-                logger.debug('Got exception: %s.', e)
-                raise GoogleConnectionError("Failed to get '%s'." % url)
-
-        resp = self._resp
-        if resp.status in {301, 302, 303, 307, 308}:
-            redirection_url = resp.getheader('location', '')
-            if 'sorry/IndexRedirect?' in redirection_url:
-                raise GoogleConnectionError('Connection blocked due to unusual activity.')
-            self._redirect(redirection_url)
-
-        if resp.status != 200:
-            raise GoogleConnectionError('Got HTTP %d: %s' % (resp.status, resp.reason))
-
-        payload = resp.read()
-        try:
-            return gzip.GzipFile(fileobj=io.BytesIO(payload)).read().decode('utf-8')
-        except OSError:
-            # Not gzipped
-            return payload.decode('utf-8')
-
-    def _redirect(self, url):
-        """Redirect to and fetch a new URL.
-
-        Like `_raw_get`, the response is stored in ``self._resp``. A new
-        connection is made if redirecting to a different host.
-
-        Parameters
-        ----------
-        url : str
-            If absolute and points to a different host, make a new
-            connection.
-
-        Raises
-        ------
-        GoogleConnectionError
-
-        """
-        logger.debug('Redirecting to URL [%s]', url)
-        segments = urllib.parse.urlparse(url)
-
-        host = segments.netloc
-        if host != self._host:
-            self.new_connection(host)
-
-        relurl = urllib.parse.urlunparse(('', '') + segments[2:])
-        try:
-            self._raw_get(relurl)
-        except http.client.HTTPException as e:
-            logger.debug('Got exception: %s.', e)
-            raise GoogleConnectionError("Failed to get '%s'." % url)
-
-    def _raw_get(self, url):
-        """Make a raw HTTP GET request.
-
-        No status check (which implies no redirection). Response can be
-        accessed from ``self._resp``.
-
-        Parameters
-        ----------
-        url : str
-            URL relative to the host, used in the GET request.
-
-        Raises
-        ------
-        http.client.HTTPException
-
-        """
-        logger.debug('Fetching URL [%s]', url)
-        self._conn.request('GET', url, None, {
-            'Accept-Encoding': 'gzip',
-            'User-Agent': USER_AGENT,
-        })
-        self._resp = self._conn.getresponse()
-
-    def close(self):
-        """Close the connection (if one is active)."""
-        if self._conn:
-            self._conn.close()
 
 
 def annotate_tag(annotated_starttag_handler):
@@ -1402,6 +1185,10 @@ class GooglerCmd(object):
 
     # Class variables
     colors = None
+    REQUEST_HEADERS = {
+        'Accept-Encoding': 'gzip',
+        'User-Agent': USER_AGENT,
+    }
 
     def __init__(self, opts):
         super().__init__()
@@ -1409,8 +1196,8 @@ class GooglerCmd(object):
         self._opts = opts
 
         self._google_url = GoogleUrl(opts)
-        self._conn = GoogleConnection(self._google_url.hostname)
-        atexit.register(self._conn.close)
+
+        self._url_opener = urllib.request.build_opener()
 
         self.results = []
         self._results_filtered = False
@@ -1432,10 +1219,6 @@ class GooglerCmd(object):
 
         Results are stored in ``self.results``.
 
-        Raises
-        ------
-        GoogleConnectionError
-
         See Also
         --------
         fetch_and_display
@@ -1443,7 +1226,28 @@ class GooglerCmd(object):
         """
         # This method also sets self._results_filtered and
         # self._urltable.
-        page = self._conn.fetch_page(self._google_url.relative())
+
+        url = self._google_url.url
+        logger.debug('Fetching %s', url)
+        try:
+            resp = self._url_opener.open(urllib.request.Request(url, headers=self.REQUEST_HEADERS))
+        except (http.client.HTTPException, urllib.error.URLError) as e:
+            logger.error('Failed to open %s: %s', url, e)
+            sys.exit(1)
+
+        if 'sorry/IndexRedirect?' in resp.geturl():
+            logger.error('Connection blocked due to unusual activity.')
+            sys.exit(1)
+        if resp.status != 200:
+            logger.error('Got HTTP %d: %s', resp.status, resp.reason)
+            sys.exit(1)
+
+        payload = resp.read()
+        try:
+            page = gzip.GzipFile(fileobj=io.BytesIO(payload)).read().decode('utf-8')
+        except OSError:
+            # Not gzipped
+            page = payload.decode('utf-8')
 
         if logger.isEnabledFor(logging.DEBUG):
             import tempfile
@@ -1501,10 +1305,6 @@ class GooglerCmd(object):
         interactive : bool, optional
             Whether to show contextual instructions, when e.g. Google
             has filtered the results. Default is True.
-
-        Raises
-        ------
-        GoogleConnectionError
 
         See Also
         --------
@@ -1578,7 +1378,7 @@ class GooglerCmd(object):
     @require_keywords
     @no_argument
     def do_open(self):
-        open_url(self._google_url.full())
+        open_url(self._google_url.url)
 
     @require_keywords
     @no_argument
