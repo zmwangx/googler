@@ -12,6 +12,7 @@ packages:
       - make
     deps:
       - python
+    container: "archlinux/base"
   centos7.0:
     builddeps:
       - make
@@ -75,6 +76,11 @@ packages:
     deps:
       - python3
   fedora28:
+    builddeps:
+      - make
+    deps:
+      - python3
+  fedora29:
     builddeps:
       - make
     deps:
